@@ -62,7 +62,8 @@ static const char *prog = "cifs.upcall";
 typedef enum _sectype {
 	NONE = 0,
 	KRB5,
-	MS_KRB5
+	MS_KRB5,
+	SPNEGO
 } sectype_t;
 
 /*
@@ -520,6 +521,147 @@ out_free_context:
 	return ret;
 }
 
+struct decoded_args {
+	int ver;
+	char *hostname;
+	char *ip;
+	char *username;
+	uid_t uid;
+	uid_t creduid;
+	pid_t pid;
+	sectype_t sec;
+	char *gss_token;
+};
+
+#include <gssapi/gssapi_krb5.h>
+
+static void display_error(int type, OM_uint32 code) {
+    OM_uint32 maj, min, ctx = 0;
+    gss_buffer_desc status;
+
+    do {
+        maj = gss_display_status(
+                   &min,
+                   code,
+                   type,
+                   GSS_C_NO_OID,
+                   &ctx,
+                   &status);
+        syslog(LOG_DEBUG, "%.*s\n", (int)status.length, (char *)status.value);
+        gss_release_buffer(&min, &status);
+    } while (!GSS_ERROR(maj) && (ctx != 0));
+}
+
+static void log_error(const char *fn, uint32_t maj, uint32_t min)
+{
+    syslog(LOG_DEBUG, "%s: failed", fn);
+    display_error(GSS_C_GSS_CODE, maj);
+    display_error(GSS_C_MECH_CODE, min);
+}
+
+
+static char spnego_oid_bytes[] = "\x2b\x06\x01\x05\x05\x02";
+gss_OID_desc spnego_mech_oid = { 6, &spnego_oid_bytes };
+
+static char ntlmssp_oid_bytes[] = "\x2b\x06\x01\x04\x01\xb7\x7d\x85\x0f\x01";
+gss_OID_desc ntlmssp_mech_oid = { 10, &ntlmssp_oid_bytes };
+
+static int
+handle_gssapi(struct decoded_args *arg, DATA_BLOB *secblob, DATA_BLOB *sess_key, char *cont)
+{
+        OM_uint32 min, maj;
+        gss_cred_id_t creds = GSS_C_NO_CREDENTIAL;
+        gss_ctx_id_t context = GSS_C_NO_CONTEXT;
+        gss_buffer_set_t skey = GSS_C_NO_BUFFER_SET;
+        gss_buffer_desc input_token = GSS_C_EMPTY_BUFFER;
+        gss_buffer_desc output_token = GSS_C_EMPTY_BUFFER;
+        gss_buffer_desc raw_target_name = GSS_C_EMPTY_BUFFER;
+        gss_buffer_desc serialized_ctx = GSS_C_EMPTY_BUFFER;
+        gss_name_t gss_target_name = GSS_C_NO_NAME;
+
+	setenv("KRB5_TRACE", "/tst", 1);
+	setenv("NTLM_USER_FILE", "/etc/ntlm_uf", 1);
+
+        int rc = -1;
+        char spn[200];
+        sprintf(spn, "CIFS@%s", arg->hostname);
+
+        syslog(LOG_DEBUG, "spn: %s", spn);
+
+        raw_target_name.value = spn;
+        raw_target_name.length = strlen(spn);
+
+        maj = gss_import_name(&min, &raw_target_name, GSS_C_NT_HOSTBASED_SERVICE, &gss_target_name);
+        if (GSS_ERROR(maj)) {
+                syslog(LOG_DEBUG, "%s: failed to import target name (%d)", __func__, maj);
+                goto done;
+        }
+
+	if (0 && arg->gss_token) {
+		input_token.value = arg->gss_token;
+		input_token.length = 86; // TEMP!!!
+	}
+
+        maj = gss_init_sec_context(&min, creds, &context, gss_target_name, GSS_C_NO_OID,//&ntlmssp_mech_oid, &spnego_mech_oid,
+                                   0,/*GSS_C_REPLAY_FLAG|GSS_C_MUTUAL_FLAG,*/ 0, GSS_C_NO_CHANNEL_BINDINGS,
+                                   &input_token, NULL, &output_token, NULL, NULL);
+        if (GSS_ERROR(maj)) {
+                syslog(LOG_DEBUG, "%s: failed to init security context (%d)", __func__, maj);
+		log_error("gss_init_sec_context", maj, min);
+                goto done;
+        }
+
+	if (maj == GSS_S_CONTINUE_NEEDED) {
+		maj = gss_export_sec_context(&min, &context, &serialized_ctx);
+		if (GSS_ERROR(maj)) {
+			syslog(LOG_DEBUG, "%s: failed to export ctx (%d)", __func__, maj);
+			log_error("gss_export_sec_context", maj, min);
+			goto done;
+		}
+
+		*cont = 1;
+		*sess_key = data_blob(serialized_ctx.value, serialized_ctx.length);
+	}
+	else if (maj == GSS_S_COMPLETE) {
+		maj = gss_inquire_sec_context_by_oid(&min, context,
+						     GSS_C_INQ_SSPI_SESSION_KEY,
+						     &skey);
+		if (GSS_ERROR(maj) || skey == GSS_C_NO_BUFFER_SET || !skey->count) {
+			syslog(LOG_DEBUG, "%s: failed to inquire for session key (%d)", __func__, maj);
+			goto done;
+		}
+
+		*sess_key = data_blob(skey->elements[0].value, skey->elements[0].length);
+	}
+	else {
+                syslog(LOG_DEBUG, "%s: unexpected gss status (%d)", __func__, maj);
+                goto done;
+        }
+
+        *secblob = data_blob(output_token.value, output_token.length);
+
+        rc = 0;
+
+done:
+
+        if (gss_target_name != GSS_C_NO_NAME)
+                gss_release_name(&min, &gss_target_name);
+
+        if (creds != GSS_C_NO_CREDENTIAL)
+                gss_release_cred(&min, &creds);
+
+        if (context != GSS_C_NO_CONTEXT)
+                gss_delete_sec_context(&min, &context, GSS_C_NO_BUFFER);
+
+        if (output_token.value && output_token.length)
+                gss_release_buffer(&min, &output_token);
+
+        if (skey != GSS_C_NO_BUFFER_SET)
+                gss_release_buffer_set(&min, &skey);
+
+        return rc;
+}
+
 /*
  * Prepares AP-REQ data for mechToken and gets session key
  * Uses credentials from cache. It will not ask for password
@@ -579,17 +721,6 @@ handle_krb5_mech(const char *oid, const char *host, DATA_BLOB * secblob,
 #define DKD_HAVE_CREDUID	0x40
 #define DKD_HAVE_USERNAME	0x80
 #define DKD_MUSTHAVE_SET (DKD_HAVE_HOSTNAME|DKD_HAVE_VERSION|DKD_HAVE_SEC)
-
-struct decoded_args {
-	int ver;
-	char *hostname;
-	char *ip;
-	char *username;
-	uid_t uid;
-	uid_t creduid;
-	pid_t pid;
-	sectype_t sec;
-};
 
 static unsigned int
 decode_key_description(const char *desc, struct decoded_args *arg)
@@ -696,6 +827,26 @@ decode_key_description(const char *desc, struct decoded_args *arg)
 			}
 			retval |= DKD_HAVE_VERSION;
 			syslog(LOG_DEBUG, "ver=%d", arg->ver);
+		} else if (strncmp(tkn, "blob=", 5) == 0) {
+			if (pos == NULL)
+                                len = strlen(tkn);
+                        else
+                                len = pos - tkn;
+
+                        len -= 5;
+			if(len != 86) {
+				syslog(LOG_ERR, "invalid len of gss token");
+                                return 1;
+			}
+
+                        SAFE_FREE(arg->gss_token);
+                        arg->gss_token = strndup(tkn + 5, len);
+                        if (arg->gss_token == NULL) {
+                                syslog(LOG_ERR, "Unable to allocate memory");
+                                return 1;
+                        }
+                        //retval |= DKD_HAVE_HOSTNAME;
+                        syslog(LOG_DEBUG, "blob=%s", arg->hostname);
 		}
 		if (pos == NULL)
 			break;
@@ -848,6 +999,7 @@ int main(const int argc, char *const argv[])
 	uid_t uid;
 	char *keytab_name = NULL;
 	time_t best_time = 0;
+	char cont = 0;
 
 	hostbuf[0] = '\0';
 	memset(&arg, 0, sizeof(arg));
@@ -954,21 +1106,16 @@ int main(const int argc, char *const argv[])
 		syslog(LOG_ERR, "setuid: %s", strerror(errno));
 		goto out;
 	}
-	ccdir = resolve_krb5_dir(CIFS_DEFAULT_KRB5_USER_DIR, uid);
-	if (ccdir != NULL)
-		find_krb5_cc(ccdir, uid, &best_cache, &best_time);
-	ccname = find_krb5_cc(CIFS_DEFAULT_KRB5_DIR, uid, &best_cache,
-			      &best_time);
-	SAFE_FREE(ccdir);
-
-	/* Couldn't find credcache? Try to use keytab */
-	if (ccname == NULL && arg.username != NULL)
-		ccname = init_cc_from_keytab(keytab_name, arg.username);
 
 	host = arg.hostname;
 
+	arg.sec = SPNEGO; // TEMP
+
 	// do mech specific authorization
 	switch (arg.sec) {
+	case SPNEGO:
+		rc = handle_gssapi(&arg, &secblob, &sess_key, &cont);
+                break;
 	case MS_KRB5:
 	case KRB5:
 		/*
@@ -984,6 +1131,17 @@ int main(const int argc, char *const argv[])
 		 * TRY only:
 		 * cifs/bar.example.com@REALM
 		 */
+		ccdir = resolve_krb5_dir(CIFS_DEFAULT_KRB5_USER_DIR, uid);
+		if (ccdir != NULL)
+			find_krb5_cc(ccdir, uid, &best_cache, &best_time);
+		ccname = find_krb5_cc(CIFS_DEFAULT_KRB5_DIR, uid, &best_cache,
+				      &best_time);
+		SAFE_FREE(ccdir);
+
+		/* Couldn't find credcache? Try to use keytab */
+		if (ccname == NULL && arg.username != NULL)
+			ccname = init_cc_from_keytab(keytab_name, arg.username);
+
 		if (arg.sec == MS_KRB5)
 			oid = OID_KERBEROS5_OLD;
 		else
@@ -1071,7 +1229,7 @@ retry_new_hostname:
 		goto out;
 	}
 	keydata->version = arg.ver;
-	keydata->flags = 0;
+	keydata->flags = cont;
 	keydata->sesskey_len = sess_key.length;
 	keydata->secblob_len = secblob.length;
 	memcpy(&(keydata->data), sess_key.data, sess_key.length);
